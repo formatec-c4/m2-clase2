@@ -1,0 +1,83 @@
+#!/bin/sh
+set -eu
+
+PROMETHEUS_URL="${PROMETHEUS_URL:-http://prometheus:9090}"
+MIN_REPLICAS="${MIN_REPLICAS:-1}"
+MAX_REPLICAS="${MAX_REPLICAS:-6}"
+SCALE_UP_CPU="${SCALE_UP_CPU:-0.35}"
+SCALE_DOWN_CPU="${SCALE_DOWN_CPU:-0.08}"
+SCALE_UP_MEMORY_MB="${SCALE_UP_MEMORY_MB:-180}"
+SCALE_DOWN_MEMORY_MB="${SCALE_DOWN_MEMORY_MB:-90}"
+INTERVAL_SECONDS="${INTERVAL_SECONDS:-10}"
+COOLDOWN_SECONDS="${COOLDOWN_SECONDS:-20}"
+
+CPU_QUERY='sum(rate(container_cpu_usage_seconds_total{container_label_com_docker_compose_service="app"}[30s]))'
+MEMORY_QUERY='avg(container_memory_usage_bytes{container_label_com_docker_compose_service="app"} / 1024 / 1024)'
+
+query_prometheus() {
+  query="$1"
+  curl -fsG "${PROMETHEUS_URL}/api/v1/query" \
+    --data-urlencode "query=${query}" \
+    | jq -r '.data.result[0].value[1] // "0"'
+}
+
+current_replicas() {
+  docker compose ps app --format json \
+    | jq -s '[.[] | select(.State == "running")] | length'
+}
+
+scale_to() {
+  replicas="$1"
+  docker compose up -d --no-build --no-recreate --scale "app=${replicas}" >/tmp/autoscaler-compose.log 2>&1
+}
+
+format_number() {
+  value="$1"
+  awk "BEGIN { printf \"%.2f\", ${value} }"
+}
+
+last_scale_epoch=0
+
+echo "Autoscaler iniciado"
+echo "Config: replicas=${MIN_REPLICAS}-${MAX_REPLICAS} cpu_up=${SCALE_UP_CPU} cpu_down=${SCALE_DOWN_CPU} mem_up=${SCALE_UP_MEMORY_MB}MB mem_down=${SCALE_DOWN_MEMORY_MB}MB interval=${INTERVAL_SECONDS}s cooldown=${COOLDOWN_SECONDS}s"
+
+while true; do
+  replicas="$(current_replicas)"
+  cpu_total="$(query_prometheus "${CPU_QUERY}")"
+  memory_avg_mb="$(query_prometheus "${MEMORY_QUERY}")"
+  next_replicas="${replicas}"
+  now="$(date +%s)"
+
+  decision_reason="none"
+
+  if awk "BEGIN { exit !(${cpu_total} >= ${SCALE_UP_CPU} || ${memory_avg_mb} >= ${SCALE_UP_MEMORY_MB}) }" \
+      && [ "${replicas}" -lt "${MAX_REPLICAS}" ]; then
+    next_replicas=$((replicas + 1))
+    decision_reason="scale-up"
+  elif awk "BEGIN { exit !(${cpu_total} <= ${SCALE_DOWN_CPU} && ${memory_avg_mb} <= ${SCALE_DOWN_MEMORY_MB}) }" \
+      && [ "${replicas}" -gt "${MIN_REPLICAS}" ]; then
+    next_replicas=$((replicas - 1))
+    decision_reason="scale-down"
+  fi
+
+  cpu_display="$(format_number "${cpu_total}")"
+  memory_display="$(format_number "${memory_avg_mb}")"
+
+  if [ "${next_replicas}" != "${replicas}" ]; then
+    elapsed=$((now - last_scale_epoch))
+    if [ "${elapsed}" -ge "${COOLDOWN_SECONDS}" ]; then
+      if scale_to "${next_replicas}"; then
+        echo "Decision: ${decision_reason} ${replicas}->${next_replicas} | cpu=${cpu_display} cores | mem=${memory_display} MB"
+        last_scale_epoch="${now}"
+      else
+        echo "Decision: error al escalar ${replicas}->${next_replicas} | revisar /tmp/autoscaler-compose.log"
+      fi
+    else
+      echo "Decision: espera por cooldown | replicas=${replicas} | cpu=${cpu_display} cores | mem=${memory_display} MB | ${elapsed}s/${COOLDOWN_SECONDS}s"
+    fi
+  else
+    echo "Decision: sin cambios | replicas=${replicas} | cpu=${cpu_display} cores | mem=${memory_display} MB"
+  fi
+
+  sleep "${INTERVAL_SECONDS}"
+done
